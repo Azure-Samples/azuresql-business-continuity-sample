@@ -1,0 +1,399 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "serverName": {
+      "type": "string",
+      "metadata": {
+        "description": "The name of the server.."
+      }
+    },
+    "administratorLogin": {
+      "type": "string",
+      "metadata": {
+        "description": "Administrator username for the managed instance."
+      }
+    },
+    "administratorLoginPassword": {
+      "type": "string",
+      "metadata": {
+        "description": "The administrator login password."
+      }
+    },
+    "sqlDatabases": {
+      "type": "array",
+      "metadata": {
+        "description": "The list of the names of the databases to create."
+      }
+    },
+    "skuName": {
+      "type": "string",
+      "metadata": {
+        "description": "The name of the SKU, typically, a letter + Number code."
+      },
+      "defaultValue": "Basic"
+    },
+    "vnetName": {
+      "type": "string",
+      "metadata": {
+        "description": "The name of the virtual network."
+      },
+      "defaultValue": "sqlmivnet"
+    },
+    "addressSpace": {
+      "type": "string",
+      "metadata": {
+        "description": "A list of address blocks reserved for this virtual network in CIDR notation."
+      },
+      "defaultValue": "10.0.0.0"
+    },
+    "primaryResourceGroup": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure resource group contains primary SQL Database, it should be empty if this is primary setup."
+      },
+      "defaultValue": ""
+    },
+    "primaryServerName": {
+      "type": "string",
+      "metadata": {
+        "description": "The name of the primary server which this server is linking. It is empty if this is primary provision."
+      },
+      "defaultValue": ""
+    }
+  },
+  "variables": {
+    "location": "[resourceGroup().location]",
+    "defaultSubnetName": "default",
+    "privateEndpointSubnetName": "privateEndpoints",
+    "addressSpaceParts": "[split(parameters('addressSpace'), '.')]",
+    "addressSpacePrefixes": "[concat(parameters('addressSpace'),'/16')]",
+    "defaultSubnetAddressPrefix": "[concat(parameters('addressSpace'),'/25')]",
+    "privateEndpointSubnetAddressPrefix": "[concat(variables('addressSpaceParts')[0],'.',variables('addressSpaceParts')[1],'.',variables('addressSpaceParts')[2],'.128/27')]",
+    "sqlServerPrivateEndpointName": "[concat('sql',parameters('serverName'),parameters('vnetName'))]",
+    "privateDnsZoneResourceGroup": "[if(equals(parameters('primaryResourceGroup'),''), resourceGroup().name, parameters('primaryResourceGroup'))]",
+    "privateDnsZoneName": "privatelink.database.windows.net",
+    "primaryVNetName": "[parameters('vnetName')]"
+  },
+  "resources": [
+    {
+      "name": "[parameters('vnetName')]",
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2020-07-01",
+      "location": "[variables('location')]",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[variables('addressSpacePrefixes')]"
+          ]
+        },
+        "subnets": [
+          {
+            "properties": {
+              "addressPrefix": "[variables('defaultSubnetAddressPrefix')]"
+            },
+            "name": "[variables('defaultSubnetName')]"
+          },
+          {
+            "properties": {
+              "addressPrefix": "[variables('privateEndpointSubnetAddressPrefix')]",
+              "privateEndpointNetworkPolicies": "Disabled"
+            },
+            "name": "[variables('privateEndpointSubnetName')]"
+          }
+        ]
+      }
+    },
+    {
+      "name": "[concat(parameters('vnetName'),'/secondary-primary')]",
+      "type": "Microsoft.Network/virtualNetworks/virtualNetworkPeerings",
+      "apiVersion": "2020-07-01",
+      "condition": "[not(equals(parameters('primaryResourceGroup'), ''))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks/', parameters('vnetName'))]"
+      ],
+      "properties": {
+        "allowVirtualNetworkAccess": "true",
+        "allowForwardedTraffic": "true",
+        "allowGatewayTransit": "false",
+        "useRemoteGateways": "false",
+        "remoteVirtualNetwork": {
+          "id": "[resourceId(parameters('primaryResourceGroup'), 'Microsoft.Network/virtualNetworks', variables('primaryVNetName'))]"
+        }
+      }
+    },
+    {
+      "name": "vnetPeeringDeployment",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2020-10-01",
+      "resourceGroup": "[parameters('primaryResourceGroup')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks/', parameters('vnetName'))]"
+      ],
+      "condition": "[not(equals(parameters('primaryResourceGroup'), ''))]",
+      "properties": {
+        "parameters": {
+          "primaryVNetPeering": {
+            "value": "[concat(variables('primaryVNetName'),'/primary-secondary')]"
+          },
+          "vnetName": {
+            "value": "[parameters('vnetName')]"
+          },
+          "secondaryResourceGroup": {
+            "value": "[resourceGroup().name]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "primaryVNetPeering": {
+              "type": "string"
+            },
+            "vnetName": {
+              "type": "string"
+            },
+            "secondaryResourceGroup": {
+              "type": "string"
+            }
+          },
+          "resources": [
+            {
+              "name": "[parameters('primaryVNetPeering')]",
+              "type": "Microsoft.Network/virtualNetworks/virtualNetworkPeerings",
+              "apiVersion": "2020-07-01",
+              "properties": {
+                "allowVirtualNetworkAccess": "true",
+                "allowForwardedTraffic": "true",
+                "allowGatewayTransit": "false",
+                "useRemoteGateways": "false",
+                "remoteVirtualNetwork": {
+                  "id": "[resourceId(parameters('secondaryResourceGroup'), 'Microsoft.Network/virtualNetworks', parameters('vnetName'))]"
+                }
+              }
+            }
+          ]
+        },
+        "mode": "Incremental",
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        }
+      }
+    },
+    {
+      "name": "[variables('privateDnsZoneName')]",
+      "type": "Microsoft.Network/privateDnsZones",
+      "condition": "[equals(variables('privateDnsZoneResourceGroup'), resourceGroup().name)]",
+      "apiVersion": "2018-09-01",
+      "location": "global",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks/', parameters('vnetName'))]"
+      ],
+      "properties": {},
+      "resources": [
+        {
+          "name": "[concat(parameters('vnetName'),'link')]",
+          "condition": "[equals(variables('privateDnsZoneResourceGroup'), resourceGroup().name)]",
+          "type": "virtualNetworkLinks",
+          "apiVersion": "2018-09-01",
+          "dependsOn": [
+            "[resourceId('Microsoft.Network/privateDnsZones', variables('privateDnsZoneName'))]"
+          ],
+          "location": "global",
+          "properties": {
+            "virtualNetwork": {
+              "id": "[resourceId('Microsoft.Network/virtualNetworks', parameters('vNetName'))]"
+            },
+            "registrationEnabled": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "[variables('sqlServerPrivateEndpointName')]",
+      "type": "Microsoft.Network/privateEndpoints",
+      "apiVersion": "2020-07-01",
+      "location": "[variables('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks/', parameters('vnetName'))]",
+        "[resourceId('Microsoft.Sql/servers', parameters('serverName'))]",
+        "[resourceId('Microsoft.Network/privateDnsZones', variables('privateDnsZoneName'))]"
+      ],
+      "properties": {
+        "subnet": {
+          "id": "[concat(resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName')), '/subnets/', variables('privateEndpointSubnetName'))]"
+        },
+        "privateLinkServiceConnections": [
+          {
+            "properties": {
+              "privateLinkServiceId": "[resourceId('Microsoft.Sql/servers', parameters('serverName'))]",
+              "groupIds": [
+                "sqlServer"
+              ],
+              "privateLinkServiceConnectionState": {
+                "status": "Approved",
+                "description": "Auto-approved",
+                "actionsRequired": "None"
+              }
+            },
+            "name": "[concat(variables('sqlServerPrivateEndpointName'),'link')]"
+          }
+        ],
+        "manualPrivateLinkServiceConnections": []
+      },
+      "resources": [
+        {
+          "name": "default",
+          "type": "privateDnsZoneGroups",
+          "dependsOn": [
+            "[resourceId('Microsoft.Network/privateEndpoints', variables('sqlServerPrivateEndpointName'))]"
+          ],
+          "apiVersion": "2020-07-01",
+          "properties": {
+            "privateDnsZoneConfigs": [
+              {
+                "name": "config1",
+                "properties": {
+                  "privateDnsZoneId": "[resourceId(variables('privateDnsZoneResourceGroup'), 'Microsoft.Network/privateDnsZones', 'privatelink.database.windows.net')]"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "Microsoft.Sql/servers",
+      "apiVersion": "2020-11-01-preview",
+      "dependsOn": [
+        "[parameters('vnetName')]"
+      ],
+      "name": "[parameters('serverName')]",
+      "location": "[variables('location')]",
+      "properties": {
+        "administratorLogin": "[parameters('administratorLogin')]",
+        "administratorLoginPassword": "[parameters('administratorLoginPassword')]",
+        "version": "12.0",
+        "minimalTlsVersion": "1.2",
+        "publicNetworkAccess": "Disabled"
+      }
+    },
+    {
+      "name": "[concat(parameters('serverName'), '/', parameters('sqlDatabases')[copyIndex()])]",
+      "dependsOn": [
+        "[parameters('serverName')]"
+      ],
+      "condition": "[equals(variables('privateDnsZoneResourceGroup'), resourceGroup().name)]",
+      "type": "Microsoft.Sql/servers/databases",
+      "apiVersion": "2020-11-01-preview",
+      "copy": {
+        "name": "databaseName",
+        "count": "[length(parameters('sqlDatabases'))]"
+      },
+      "location": "[variables('location')]",
+      "tags": {},
+      "sku": {
+        "name": "[parameters('skuName')]"
+      }
+    },
+    {
+      "name": "failoverGroupDeployment",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2020-10-01",
+      "resourceGroup": "[parameters('primaryResourceGroup')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('serverName'))]"
+      ],
+      "condition": "[not(equals(parameters('primaryResourceGroup'), ''))]",
+      "properties": {
+        "parameters": {
+          "primaryServerName": {
+            "value": "[parameters('primaryServerName')]"
+          },
+          "sqlazurefogname": {
+            "value": "[concat('fog', parameters('primaryServerName'))]"
+          },
+          "serverName": {
+            "value": "[parameters('serverName')]"
+          },
+          "sqlDatabases": {
+            "value": "[parameters('sqlDatabases')]"
+          },
+          "secondaryResourceGroup": {
+            "value": "[resourceGroup().name]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "primaryServerName": {
+              "type": "string"
+            },
+            "serverName": {
+              "type": "string"
+            },
+            "sqlazurefogname": {
+              "type": "string"
+            },
+            "sqlDatabases": {
+              "type": "array"
+            },
+            "secondaryResourceGroup": {
+              "type": "string"
+            }
+          },
+          "resources": [
+            {
+              "name": "[concat(parameters('primaryServerName'), '/', parameters('sqlazurefogname'))]",
+              "type": "Microsoft.Sql/servers/failoverGroups",
+              "apiVersion": "2015-05-01-preview",
+              "tags": {},
+              "properties": {
+                "readWriteEndpoint": {
+                  "failoverPolicy": "Manual"
+                },
+                "readOnlyEndpoint": {
+                  "failoverPolicy": "Disabled"
+                },
+                "partnerServers": [
+                  {
+                    "id": "[resourceId(parameters('secondaryResourceGroup'), 'Microsoft.Sql/servers', parameters('serverName'))]"
+                  }
+                ],
+                "copy": [
+                  {
+                    "name": "databases",
+                    "count": "[length(parameters('sqlDatabases'))]",
+                    "input": "[resourceId(resourceGroup().name, 'Microsoft.Sql/servers/databases', parameters('primaryServerName'), parameters('sqlDatabases')[copyIndex('databases')])]"
+                  }
+                ]
+              }
+            }
+          ],
+          "outputs": {
+            "values": {
+              "type": "string",
+              "value": "[parameters('sqlazurefogname')]"
+            }
+          }
+        },
+        "mode": "Incremental",
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "sqlServerNameFQDN": {
+      "type": "string",
+      "value": "[reference(parameters('serverName')).fullyQualifiedDomainName]"
+    },
+    "sqlazurefogname": {
+      "type": "string",
+      "condition": "[not(equals(parameters('primaryResourceGroup'), ''))]",
+      "value": "[reference(resourceId(parameters('primaryResourceGroup'), 'Microsoft.Resources/deployments', 'failoverGroupDeployment'), '2020-10-01').outputs.values.value]"
+    }
+  }
+}
